@@ -347,7 +347,7 @@ class WeatherNoiseFilterNode(Node):
         ).to(self.device)
         
         if model_path:
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.get_logger().info(f'Loaded model from {model_path}')
         else:
