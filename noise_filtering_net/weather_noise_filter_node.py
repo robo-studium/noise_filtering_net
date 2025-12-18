@@ -12,11 +12,13 @@ import sensor_msgs_py.point_cloud2 as pc2
 
 
 # =================================================
-# U-Net Model Definition
+# Basic Blocks
 # =================================================
+
 
 class DoubleConv(nn.Module):
     """(Conv2d -> BatchNorm -> ReLU) * 2"""
+
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
         if not mid_channels:
@@ -36,11 +38,11 @@ class DoubleConv(nn.Module):
 
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels)
+            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels)
         )
 
     def forward(self, x):
@@ -49,8 +51,10 @@ class Down(nn.Module):
 
 class Up(nn.Module):
     """Upscaling then double conv"""
+
     def __init__(self, in_channels, out_channels, bilinear=True):
         super().__init__()
+
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
             self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
@@ -62,12 +66,15 @@ class Up(nn.Module):
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
+
         diffY = x2.size(2) - x1.size(2)
         diffX = x2.size(3) - x1.size(3)
-        x1 = nn.functional.pad(
+
+        x1 = F.pad(
             x1,
             [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2],
         )
+
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
@@ -81,59 +88,80 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 
-class BottleneckSpatialAttention(nn.Module):
-    """Full spatial self-attention over H x W tokens"""
+# =================================================
+# Bottleneck Axial Attention
+# =================================================
+
+
+class BottleneckAxialAttention(nn.Module):
+    """
+    Axial Self-Attention along width (yaw direction only)
+    """
+
     def __init__(self, channels, num_heads=4):
         super().__init__()
         self.norm = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(
-            embed_dim=channels,
-            num_heads=num_heads,
-            batch_first=True
+            embed_dim=channels, num_heads=num_heads, batch_first=True
         )
 
     def forward(self, x):
+        """
+        x: (B, C, H, W)
+        """
         B, C, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        x_norm = self.norm(x_flat)
+
+        # Collapse vertical dimension (pitch)
+        x_mean = x.mean(dim=2)  # (B, C, W)
+        x_seq = x_mean.permute(0, 2, 1)  # (B, W, C)
+
+        # Self-attention along width
+        x_norm = self.norm(x_seq)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x_out = x_flat + attn_out
-        x_out = x_out.reshape(B, H, W, C).permute(0, 3, 1, 2)
-        return x_out
+
+        # Back to (B, C, W)
+        attn_out = attn_out.permute(0, 2, 1)
+
+        # Expand back to H dimension
+        attn_out = attn_out.unsqueeze(2).expand(-1, -1, H, -1)
+
+        # Residual connection
+        return x + attn_out
+
+
+# =================================================
+# U-Net with Bottleneck Attention
+# =================================================
 
 
 class UNetDenoiser(nn.Module):
+    """
+    U-Net + Bottleneck Axial Attention for LiDAR range image denoising
+    """
+
     def __init__(
         self,
-        in_channels=7,
+        in_channels=5,
         num_classes=2,
         base_channels=64,
         bilinear=False,
         attn_heads=4,
     ):
         super().__init__()
-        assert in_channels == 7, "Expected 7 input channels"
-        
-        # Branch encoders
-        self.inc_spatial = DoubleConv(5, base_channels // 2)
-        self.inc_temporal = DoubleConv(2, base_channels // 2)
-        self.inc_fuse = DoubleConv(base_channels, base_channels)
-        
-        # Encoder
+
+        self.inc = DoubleConv(in_channels, base_channels)
         self.down1 = Down(base_channels, base_channels * 2)
         self.down2 = Down(base_channels * 2, base_channels * 4)
         self.down3 = Down(base_channels * 4, base_channels * 8)
-        
+
         factor = 2 if bilinear else 1
         self.down4 = Down(base_channels * 8, base_channels * 16 // factor)
-        
+
         # Bottleneck Attention
-        self.bottleneck_attn = BottleneckSpatialAttention(
-            base_channels * 16 // factor,
-            num_heads=attn_heads
+        self.bottleneck_attn = BottleneckAxialAttention(
+            base_channels * 16 // factor, num_heads=attn_heads
         )
-        
-        # Decoder
+
         self.up1 = Up(base_channels * 16, base_channels * 8 // factor, bilinear)
         self.up2 = Up(base_channels * 8, base_channels * 4 // factor, bilinear)
         self.up3 = Up(base_channels * 4, base_channels * 2 // factor, bilinear)
@@ -141,28 +169,21 @@ class UNetDenoiser(nn.Module):
         self.outc = OutConv(base_channels, num_classes)
 
     def forward(self, x):
-        x_spatial = x[:, :5, :, :]
-        x_temporal = x[:, 5:, :, :]
-        
-        f_spatial = self.inc_spatial(x_spatial)
-        f_temporal = self.inc_temporal(x_temporal)
-        
-        x1 = torch.cat([f_spatial, f_temporal], dim=1)
-        x1 = self.inc_fuse(x1)
-        
+        x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
-        
+
+        # Bottleneck Attention
         x5 = self.bottleneck_attn(x5)
-        
+
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
-        
-        return self.outc(x)
+        logits = self.outc(x)
+        return logits
 
 
 # =================================================
