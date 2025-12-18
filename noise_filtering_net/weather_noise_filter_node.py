@@ -418,23 +418,6 @@ class WeatherNoiseFilterNode(Node):
             proj_range, proj_xyz, proj_intensity, proj_mask, proj_idx = \
                 self.projector.project(xyz, intensity)
             
-            # Initialize temporal difference channels
-            delta_range = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
-            delta_intensity = np.zeros((self.proj_h, self.proj_w), dtype=np.float32)
-            
-            # Compute temporal differences
-            if self.use_temporal and self.prev_frame is not None:
-                prev_range, prev_intensity_proj, prev_mask = self.prev_frame
-                valid_both = (proj_mask > 0) & (prev_mask > 0)
-                
-                if valid_both.sum() > 0:
-                    delta_range[valid_both] = proj_range[valid_both] - prev_range[valid_both]
-                    delta_intensity[valid_both] = proj_intensity[valid_both] - prev_intensity_proj[valid_both]
-            
-            # Store current frame for next iteration
-            if self.use_temporal:
-                self.prev_frame = (proj_range.copy(), proj_intensity.copy(), proj_mask.copy())
-            
             # Create input tensor: [x, y, z, intensity, range, Î"range, Î"intensity]
             input_img = np.stack([
                 proj_xyz[:, :, 0],
@@ -446,21 +429,18 @@ class WeatherNoiseFilterNode(Node):
             
             # Normalize
             valid_pixels = proj_mask > 0
-            for c in range(7):
+            for c in range(5):
                 channel = input_img[c]
                 if valid_pixels.sum() == 0:
                     channel[:] = 0
                     continue
-                
-                if c in [5, 6]:  # Temporal channels: clip only
-                    channel[valid_pixels] = np.clip(channel[valid_pixels], -5.0, 5.0)
-                    channel[~valid_pixels] = 0
-                else:  # Spatial channels: normalize
-                    valid_values = channel[valid_pixels]
-                    mean = valid_values.mean()
-                    std = valid_values.std() + 1e-6
-                    channel[valid_pixels] = (valid_values - mean) / std
-                    channel[~valid_pixels] = 0
+            
+                valid_values = channel[valid_pixels]
+                mean = valid_values.mean()
+                std = valid_values.std() + 1e-6
+                channel[valid_pixels] = (valid_values - mean) / std
+                channel[~valid_pixels] = 0
+
             
             # Model inference
             input_tensor = torch.from_numpy(input_img).unsqueeze(0).to(self.device)
