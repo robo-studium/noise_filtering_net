@@ -331,7 +331,7 @@ class WeatherNoiseFilterNode(Node):
         super().__init__('weather_noise_filter')
         
         # Parameters
-        self.declare_parameter('model_path', '/home/kbkn/best_model.pth')
+        self.declare_parameter('model_path', '/home/kbkn/simple_pointnet/u_net/outputs/best_model.pth')
         self.declare_parameter('proj_h', 64)
         self.declare_parameter('proj_w', 1024)
         self.declare_parameter('fov_up', 2.0)
