@@ -396,7 +396,6 @@ class WeatherNoiseFilterNode(Node):
         self.get_logger().info('Weather noise filter node initialized')
         self.get_logger().info(f'Subscribing to: {input_topic}')
         self.get_logger().info(f'Publishing to: {output_topic}')
-        self.get_logger().info(f'Temporal features: {"enabled" if self.use_temporal else "disabled"}')
 
     def pointcloud_callback(self, msg):
         try:
