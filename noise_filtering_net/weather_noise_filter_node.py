@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.neighbors import KDTree
 
 import rclpy
@@ -338,7 +339,6 @@ class WeatherNoiseFilterNode(Node):
         self.declare_parameter('fov_down', -24.9)
         self.declare_parameter('base_channels', 64)
         self.declare_parameter('knn_k', 5)
-        self.declare_parameter('use_temporal', True)
         self.declare_parameter('input_topic', '/points_raw')
         self.declare_parameter('output_topic', '/points_filtered')
         
@@ -349,7 +349,6 @@ class WeatherNoiseFilterNode(Node):
         self.fov_down = self.get_parameter('fov_down').value
         base_channels = self.get_parameter('base_channels').value
         self.knn_k = self.get_parameter('knn_k').value
-        self.use_temporal = self.get_parameter('use_temporal').value
         input_topic = self.get_parameter('input_topic').value
         output_topic = self.get_parameter('output_topic').value
         
