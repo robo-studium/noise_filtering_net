@@ -360,7 +360,7 @@ class WeatherNoiseFilterNode(Node):
         # Load model
         self.get_logger().info('Loading model...')
         self.model = UNetDenoiser(
-            in_channels=7,
+            in_channels=5,
             num_classes=2,
             base_channels=base_channels,
             bilinear=False,
@@ -442,8 +442,6 @@ class WeatherNoiseFilterNode(Node):
                 proj_xyz[:, :, 2],
                 proj_intensity,
                 proj_range,
-                delta_range,
-                delta_intensity,
             ], axis=0).astype(np.float32)
             
             # Normalize
