@@ -5,10 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.neighbors import KDTree
+import os
+from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
 
 
@@ -73,7 +75,6 @@ class LightUp(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        # Reduce channels after concatenation
         self.conv = nn.Sequential(
             DepthwiseSeparableConv(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
@@ -83,12 +84,10 @@ class LightUp(nn.Module):
     def forward(self, x1, x2):
         x1 = self.up(x1)
         
-        # Handle size mismatch
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
         
-        # Concatenate skip connection
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
@@ -105,20 +104,7 @@ class OutConv(nn.Module):
 
 
 class StudentUNet(nn.Module):
-    """
-    Lightweight Student U-Net for Knowledge Distillation
-    
-    Key features:
-    - Depthwise Separable Convolutions throughout
-    - No Attention modules
-    - Efficient decoder with bilinear upsampling
-    - Feature extraction support for distillation
-    
-    Args:
-        in_channels: Number of input channels (5: x, y, z, intensity, range)
-        num_classes: Number of output classes (2: noise, clean)
-        base_channels: Base number of channels (24 or 32 recommended)
-    """
+    """Lightweight Student U-Net for Knowledge Distillation"""
     
     def __init__(self, in_channels=5, num_classes=2, base_channels=24):
         super().__init__()
@@ -126,86 +112,38 @@ class StudentUNet(nn.Module):
         self.num_classes = num_classes
         self.base_channels = base_channels
         
-        # Encoder
         self.inc = LightDoubleConv(in_channels, base_channels)
-        self.down1 = LightDown(base_channels, base_channels * 2)      # 24 -> 48
-        self.down2 = LightDown(base_channels * 2, base_channels * 4)  # 48 -> 96
-        self.down3 = LightDown(base_channels * 4, base_channels * 8)  # 96 -> 192
+        self.down1 = LightDown(base_channels, base_channels * 2)
+        self.down2 = LightDown(base_channels * 2, base_channels * 4)
+        self.down3 = LightDown(base_channels * 4, base_channels * 8)
+        self.down4 = LightDown(base_channels * 8, base_channels * 10)
         
-        # Bottleneck (no attention, just conv)
-        self.down4 = LightDown(base_channels * 8, base_channels * 10) # 192 -> 240
+        self.up1 = LightUp(base_channels * 10 + base_channels * 8, base_channels * 8)
+        self.up2 = LightUp(base_channels * 8 + base_channels * 4, base_channels * 4)
+        self.up3 = LightUp(base_channels * 4 + base_channels * 2, base_channels * 2)
+        self.up4 = LightUp(base_channels * 2 + base_channels, base_channels)
         
-        # Decoder (lightweight with bilinear upsample)
-        self.up1 = LightUp(base_channels * 10 + base_channels * 8, base_channels * 8)  # 240+192 -> 192
-        self.up2 = LightUp(base_channels * 8 + base_channels * 4, base_channels * 4)   # 192+96 -> 96
-        self.up3 = LightUp(base_channels * 4 + base_channels * 2, base_channels * 2)   # 96+48 -> 48
-        self.up4 = LightUp(base_channels * 2 + base_channels, base_channels)           # 48+24 -> 24
-        
-        # Output
         self.outc = OutConv(base_channels, num_classes)
     
     def forward(self, x):
-        """Standard forward pass"""
-        # Encoder
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
         
-        # Decoder
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         
-        # Output logits
         logits = self.outc(x)
         return logits
-    
-    def forward_with_features(self, x):
-        """
-        Forward pass with intermediate features for knowledge distillation
-        
-        Returns:
-            dict: {
-                'logits': final output (B, 2, H, W)
-                'x2': encoder stage 1 output (B, 48, H/2, W/2)
-                'x3': encoder stage 2 output (B, 96, H/4, W/4)
-                'x4': encoder stage 3 output (B, 192, H/8, W/8)
-                'x5': bottleneck output (B, 240, H/16, W/16)
-            }
-        """
-        # Encoder
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        
-        # Decoder
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        
-        # Output logits
-        logits = self.outc(x)
-        
-        return {
-            'logits': logits,
-            'x2': x2,
-            'x3': x3,
-            'x4': x4,
-            'x5': x5,
-        }
 
-# =================================================
-# Range Image Projection
-# =================================================
 
 class VelodyneRangeProjection:
     """Range image projection for Velodyne HDL-64E"""
+    
     def __init__(self, proj_H=64, proj_W=1024, fov_up=2.0, fov_down=-24.9):
         self.proj_H = proj_H
         self.proj_W = proj_W
@@ -213,16 +151,6 @@ class VelodyneRangeProjection:
         self.proj_fov_down = fov_down
 
     def project(self, points, remissions):
-        """
-        Project 3D points to range image
-        
-        Args:
-            points: (N, 3) array of x, y, z coordinates
-            remissions: (N,) array of intensity values
-            
-        Returns:
-            proj_range, proj_xyz, proj_remission, proj_mask, proj_idx
-        """
         proj_range = np.full((self.proj_H, self.proj_W), -1, dtype=np.float32)
         proj_xyz = np.zeros((self.proj_H, self.proj_W, 3), dtype=np.float32)
         proj_remission = np.zeros((self.proj_H, self.proj_W), dtype=np.float32)
@@ -281,30 +209,18 @@ class VelodyneRangeProjection:
         return proj_range, proj_xyz, proj_remission, proj_mask, proj_idx
 
 
-# =================================================
-# Back Projection
-# =================================================
-
 class RangeImageBackProjection:
     """Back-project range image predictions to 3D point cloud"""
+    
     def __init__(self, proj_H=64, proj_W=1024):
         self.proj_H = proj_H
         self.proj_W = proj_W
 
-    def back_project_with_knn(
-        self, pred_img, proj_xyz, proj_idx, proj_mask, original_points, k=5
-    ):
-        """
-        Back-project predictions using KNN for unmapped points
-        
-        Returns:
-            point_labels: (N,) predicted labels (0=noise, 1=clean)
-        """
+    def back_project_with_knn(self, pred_img, proj_xyz, proj_idx, proj_mask, original_points, k=5):
         num_points = len(original_points)
         point_labels = np.ones(num_points, dtype=np.int32)
         mapped_mask = np.zeros(num_points, dtype=bool)
         
-        # Direct mapping
         for i in range(self.proj_H):
             for j in range(self.proj_W):
                 if proj_mask[i, j] > 0:
@@ -313,7 +229,6 @@ class RangeImageBackProjection:
                         point_labels[point_idx] = pred_img[i, j]
                         mapped_mask[point_idx] = True
         
-        # KNN for unmapped points
         unmapped_indices = np.where(~mapped_mask)[0]
         
         if len(unmapped_indices) > 0:
@@ -336,16 +251,13 @@ class RangeImageBackProjection:
         return point_labels
 
 
-# =================================================
-# ROS2 Node
-# =================================================
-
 class WeatherNoiseFilterNode(Node):
     def __init__(self):
         super().__init__('weather_noise_filter')
         
         # Parameters
         self.declare_parameter('model_path', '/home/kbkn/simple_pointnet/u_net/outputs_student/best_student_model.pth')
+        self.declare_parameter('output_dir', './filtered_pointclouds')
         self.declare_parameter('proj_h', 64)
         self.declare_parameter('proj_w', 1024)
         self.declare_parameter('fov_up', 2.0)
@@ -353,9 +265,9 @@ class WeatherNoiseFilterNode(Node):
         self.declare_parameter('base_channels', 24)
         self.declare_parameter('knn_k', 5)
         self.declare_parameter('input_topic', '/points_raw')
-        self.declare_parameter('output_topic', '/points_filtered')
         
         model_path = self.get_parameter('model_path').value
+        self.output_dir = self.get_parameter('output_dir').value
         self.proj_h = self.get_parameter('proj_h').value
         self.proj_w = self.get_parameter('proj_w').value
         self.fov_up = self.get_parameter('fov_up').value
@@ -363,7 +275,13 @@ class WeatherNoiseFilterNode(Node):
         base_channels = self.get_parameter('base_channels').value
         self.knn_k = self.get_parameter('knn_k').value
         input_topic = self.get_parameter('input_topic').value
-        output_topic = self.get_parameter('output_topic').value
+        
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.get_logger().info(f'Output directory: {self.output_dir}')
+        
+        # Frame counter
+        self.frame_count = 0
         
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -375,9 +293,7 @@ class WeatherNoiseFilterNode(Node):
             in_channels=5,
             num_classes=2,
             base_channels=base_channels,
-
         ).to(self.device)
-        # model = StudentUNet(in_channels=5, num_classes=2, base_channels=24)
         
         if model_path:
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
@@ -394,21 +310,16 @@ class WeatherNoiseFilterNode(Node):
         )
         self.back_projector = RangeImageBackProjection(self.proj_h, self.proj_w)
         
-        # Previous frame for temporal features
-        self.prev_frame = None
-        
-        # ROS2 pub/sub
+        # ROS2 subscription
         self.subscription = self.create_subscription(
             PointCloud2,
             input_topic,
             self.pointcloud_callback,
             10
         )
-        self.publisher = self.create_publisher(PointCloud2, output_topic, 10)
         
         self.get_logger().info('Weather noise filter node initialized')
         self.get_logger().info(f'Subscribing to: {input_topic}')
-        self.get_logger().info(f'Publishing to: {output_topic}')
 
     def pointcloud_callback(self, msg):
         try:
@@ -429,7 +340,7 @@ class WeatherNoiseFilterNode(Node):
             proj_range, proj_xyz, proj_intensity, proj_mask, proj_idx = \
                 self.projector.project(xyz, intensity)
             
-            # Create input tensor: [x, y, z, intensity, range, Î"range, Î"intensity]
+            # Create input tensor
             input_img = np.stack([
                 proj_xyz[:, :, 0],
                 proj_xyz[:, :, 1],
@@ -445,13 +356,12 @@ class WeatherNoiseFilterNode(Node):
                 if valid_pixels.sum() == 0:
                     channel[:] = 0
                     continue
-            
+                
                 valid_values = channel[valid_pixels]
                 mean = valid_values.mean()
                 std = valid_values.std() + 1e-6
                 channel[valid_pixels] = (valid_values - mean) / std
                 channel[~valid_pixels] = 0
-
             
             # Model inference
             input_tensor = torch.from_numpy(input_img).unsqueeze(0).to(self.device)
@@ -460,7 +370,7 @@ class WeatherNoiseFilterNode(Node):
                 outputs = self.model(input_tensor)
                 pred_img = torch.argmax(outputs, dim=1)[0].cpu().numpy()
             
-            # Back-project to point cloud (0=noise, 1=clean)
+            # Back-project to point cloud
             point_labels = self.back_projector.back_project_with_knn(
                 pred_img, proj_xyz, proj_idx, proj_mask, xyz, k=self.knn_k
             )
@@ -468,61 +378,28 @@ class WeatherNoiseFilterNode(Node):
             # Filter points (keep only clean points)
             clean_mask = point_labels == 1
             filtered_xyz = xyz[clean_mask]
-            filtered_intensity = (intensity[clean_mask] * 255.0).astype(np.float32)
+            filtered_intensity = points_array[clean_mask, 3:4]  # Keep original intensity
             
-            # Publish filtered point cloud
-            filtered_msg = self.create_pointcloud2(
-                filtered_xyz,
-                filtered_intensity,
-                msg.header
-            )
-            self.publisher.publish(filtered_msg)
+            # Combine xyz and intensity: (N, 4)
+            filtered_points = np.hstack([filtered_xyz, filtered_intensity]).astype(np.float32)
+            
+            # Save as .bin file
+            output_filename = os.path.join(self.output_dir, f'{self.frame_count:06d}.bin')
+            filtered_points.tofile(output_filename)
             
             # Log stats
             noise_count = np.sum(point_labels == 0)
             clean_count = np.sum(point_labels == 1)
             self.get_logger().info(
-                f'Filtered: {noise_count} noise, {clean_count} clean '
-                f'({noise_count/(noise_count+clean_count)*100:.1f}% removed)',
+                f'Frame {self.frame_count}: Saved {clean_count} points to {output_filename} '
+                f'(removed {noise_count} noise points, {noise_count/(noise_count+clean_count)*100:.1f}%)',
                 throttle_duration_sec=1.0
             )
             
+            self.frame_count += 1
+            
         except Exception as e:
             self.get_logger().error(f'Error processing point cloud: {str(e)}')
-
-    def create_pointcloud2(self, xyz, intensity, header):
-        """Create PointCloud2 message from xyz and intensity"""
-        fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
-        ]
-        
-        points = np.zeros(len(xyz), dtype=[
-            ('x', np.float32),
-            ('y', np.float32),
-            ('z', np.float32),
-            ('intensity', np.float32),
-        ])
-        
-        points['x'] = xyz[:, 0]
-        points['y'] = xyz[:, 1]
-        points['z'] = xyz[:, 2]
-        points['intensity'] = intensity
-        
-        msg = PointCloud2()
-        msg.header = header
-        msg.height = 1
-        msg.width = len(xyz)
-        msg.fields = fields
-        msg.is_bigendian = False
-        msg.point_step = 16
-        msg.row_step = msg.point_step * msg.width
-        msg.is_dense = True
-        msg.data = points.tobytes()
-        
-        return msg
 
 
 def main(args=None):
